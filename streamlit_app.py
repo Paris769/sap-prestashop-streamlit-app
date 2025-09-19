@@ -38,7 +38,8 @@ import streamlit as st
 # to store its internal state. Without this, file uploads may silently fail.
 
 try:
-    import pdfplumber  # type: ignore
+import pdfplumber  # type: ignore
+import re
 except ImportError:
     pdfplumber = None  # pdf parsing will be disabled if library is missing
 
@@ -183,77 +184,78 @@ def parse_order_file(uploaded_file) -> List[Dict[str, any]]:
     Returns a list of order lines with vendor_code, item_description and quantity."""
     name = uploaded_file.name.lower()
     rows: List[Dict[str, any]] = []
-    if name.endswith('.pdf'):
+        if name.endswith('.pdf'):
         if pdfplumber is None:
             st.error("Il supporto per i file PDF non è disponibile: pdfplumber non è installato.")
             return []
         # Read PDF from bytes to avoid issues with the UploadedFile being reset
         pdf_bytes = uploaded_file.getvalue()
-        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        for page in pdf.pages:
-            table = page.extract_table()
-            if not table:
-                # Fallback to text parsing when no table is found.
-                # Extract the raw text from the page and attempt to parse
-                # each product line. We look for a header marker ('Articolo Fornitore')
-                # to know when the item rows start, skip HSN codes and total lines,
-                # and split columns based on runs of two or more spaces. This
-                # heuristic works for the Optima order PDFs which list the
-                # product description followed by quantity, price and total.
-                text = page.extract_text()
-                if text:
-                    lines = [l.strip() for l in text.split('\n') if l.strip()]
-                    start_parsing = False
-                    for line_txt in lines:
-                        # Identify the start of the product list. In the Optima
-                        # PDFs the header line contains 'Articolo Fornitore'.
-                        if 'Articolo Fornitore' in line_txt:
-                            start_parsing = True
+            with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+                for page in pdf.pages:
+                    table = page.extract_table()
+                    if not table:
+                        # Fallback to text parsing when no table is found.
+                        # Extract the raw text from the page and attempt to parse
+                        # each product line. We look for a header marker ('Articolo Fornitore')
+                        # to know when the item rows start, skip HSN codes and total lines,
+                        # and split columns based on runs of two or more spaces. This
+                        # heuristic works for the Optima order PDFs which list the
+                        # product description followed by quantity, price and total.
+                        text = page.extract_text()
+                        if text:
+                            lines = [l.strip() for l in text.split('\n') if l.strip()]
+                            start_parsing = False
+                            for line_txt in lines:
+                                # Identify the start of the product list. In the Optima
+                                # PDFs the header line contains 'Articolo Fornitore'.
+                                if 'Articolo Fornitore' in line_txt:
+                                    start_parsing = True
+                                    continue
+                                if not start_parsing:
+                                    continue
+                                # Skip lines that are HSN codes or totals.
+                                if any(kw in line_txt for kw in ['HSN Code', 'Net Total', 'Grand Net Total']):
+                                    continue
+                                # Split by two or more spaces to separate columns.
+                                parts = re.split(r'\s{2,}', line_txt)
+                                if len(parts) >= 2:
+                                    desc = parts[0].strip()
+                                    m = re.match(r'([0-9]+,[0-9]+)', parts[1])
+                                    if m:
+                                        try:
+                                            qty_val = float(m.group(1).replace(',', '.'))
+                                        except Exception:
+                                            qty_val = 0.0
+                                        rows.append({'vendor_code': '',
+                                                     'item_description': desc,
+                                                     'qty': qty_val})
+                        # After parsing text for this page, move to next page.
+                        continue
+                    # Else: table extracted successfully. Proceed with table parsing.
+                    header = [c.lower().strip() for c in table[0]]
+                    # heuristically determine column indices
+                    def idx_of(subs: List[str], default: int) -> int:
+                        for sub in subs:
+                            for i, h in enumerate(header):
+                                if sub in h:
+                                    return i
+                        return default
+                    idx_code = idx_of(['codice', 'code', 'art'], 0)
+                    idx_desc = idx_of(['descr', 'desc', 'articolo', 'item'], 1 if len(header) > 1 else 0)
+                    idx_qty = idx_of(['quant', 'qty'], len(header) - 1)
+                    for r in table[1:]:
+                        if not r:
                             continue
-                        if not start_parsing:
-                            continue
-                        # Skip lines that are HSN codes or totals.
-                        if any(kw in line_txt for kw in ['HSN Code', 'Net Total', 'Grand Net Total']):
-                            continue
-                        # Split by two or more spaces to separate columns.
-                        parts = re.split(r'\s{2,}', line_txt)
-                        if len(parts) >= 2:
-                            desc = parts[0].strip()
-                            m = re.match(r'([0-9]+,[0-9]+)', parts[1])
-                            if m:
-                                try:
-                                    qty_val = float(m.group(1).replace(',', '.'))
-                                except Exception:
-                                    qty_val = 0.0
-                                rows.append({'vendor_code': '',
-                                             'item_description': desc,
-                                             'qty': qty_val})
-                    # After parsing text for this page, move to next page.
-                continue
-            header = [c.lower().strip() for c in table[0]]
-            # heuristically determine column indices
-            def idx_of(subs: List[str], default: int) -> int:
-                for sub in subs:
-                    for i, h in enumerate(header):
-                        if sub in h:
-                            return i
-                return default
-            idx_code = idx_of(['codice', 'code', 'art'], 0)
-            idx_desc = idx_of(['descr', 'desc', 'articolo', 'item'], 1 if len(header) > 1 else 0)
-            idx_qty = idx_of(['quant', 'qty'], len(header) - 1)
-            for r in table[1:]:
-                if not r:
-                    continue
-                code = r[idx_code] if idx_code < len(r) else ''
-                desc = r[idx_desc] if idx_desc < len(r) else ''
-                qty = r[idx_qty] if idx_qty < len(r) else '0'
-                try:
-                    qty = float(qty)
-                except Exception:
-                    qty = 0.0
-                rows.append({'vendor_code': str(code).strip(),
-                             'item_description': str(desc).strip(),
-                             'qty': qty})
+                        code = r[idx_code] if idx_code < len(r) else ''
+                        desc = r[idx_desc] if idx_desc < len(r) else ''
+                        qty = r[idx_qty] if idx_qty < len(r) else '0'
+                        try:
+                            qty = float(qty)
+                        except Exception:
+                            qty = 0.0
+                        rows.append({'vendor_code': str(code).strip(),
+                                     'item_description': str(desc).strip(),
+                                     'qty': qty})
     else:
         # Assume Excel format for other file extensions.  Read the
         # uploaded file's bytes into a buffer first to avoid exhausting
