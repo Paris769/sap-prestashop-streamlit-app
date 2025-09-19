@@ -1,56 +1,79 @@
 """
 Streamlit web app for matching customer order descriptions to product codes.
 
-This version includes fixes to the file upload widgets so that selected files
-persist after the Streamlit script reruns. Previously, `st.file_uploader`
-widgets were re-evaluated on each run without a fixed key, causing the
-selected file to disappear and leaving users uncertain whether their files
-had been uploaded. By assigning a unique `key` to each file uploader and
-storing uploaded files in `st.session_state`, the file selections remain
-visible and the data is only parsed when a new file is chosen. A small
-message confirms successful uploads.
+This app allows a user to upload a sales history Excel file and one or more customer
+order files (in PDF or Excel format).  The sales history contains, per
+customer, a product code, a description, quantities and a six‑month
+purchase frequency.  When an order is submitted, the app attempts to
+match each line of the order to a product in the history.  If the
+product code in the order matches the history, that match is used
+directly.  Otherwise, the app computes a similarity score between
+descriptions and weights that score by the frequency of purchases to
+propose the most likely product.  A threshold is used to avoid
+spurious matches.
 
-The core matching logic remains similar to the previous implementation: it
-normalizes product descriptions, performs fuzzy matching using a
-combination of Jaccard similarity and a Levenshtein ratio, and falls back
-to an exact code match when available. The results are displayed in a
-table and can be downloaded as an Excel file.
+Key improvements over earlier versions include:
+
+* File upload widgets use unique keys so that uploaded files persist
+  across reruns; this avoids losing selections when a user uploads
+  multiple files or when Streamlit refreshes the script.
+* PDFs are parsed with pdfplumber when available; text is processed
+  line by line to extract descriptions, quantities and product codes.
+* Sales history parsing is resilient to different header names by
+  inspecting column labels for key words (code, description, quantity,
+  media 6 mesi).
+* Matching logic combines Jaccard similarity on normalized tokens
+  (stopwords removed and synonyms replaced) with a Levenshtein ratio
+  and weights the result by purchase frequency.
 """
 
 import io
 import os
-from typing import Dict, List, Optional, Tuple
+import re
+from typing import Dict, List, Tuple, Any
 
 import pandas as pd
-# Before importing streamlit, ensure that any state files are written to a writable
-# directory. On Hugging Face Spaces the default HOME may be '/' (read-only) which
-# causes os.makedirs to attempt to create '/.streamlit' and raises PermissionError.
-os.environ["HOME"] = "/tmp"
-os.environ["XDG_STATE_HOME"] = "/tmp"
-os.makedirs(os.path.join(os.environ["HOME"], ".streamlit"), exist_ok=True)
 import streamlit as st
 
-# Ensure Streamlit can write its machine_id and state files to a writable directory.
-# In some container environments the default HOME or XDG_STATE_HOME points to a read-only
-# location (like '/'), which causes a `PermissionError` when Streamlit tries to write
-# `~/.streamlit/machine_id`. By overriding these variables to `/tmp` and creating
-# the `.streamlit` directory there, we guarantee that Streamlit has a valid place
-# to store its internal state. Without this, file uploads may silently fail.
-
+# Attempt to import pdfplumber for PDF parsing.  If unavailable the
+# app will still run, but PDF orders cannot be parsed.
 try:
     import pdfplumber  # type: ignore
 except ImportError:
-    pdfplumber = None  # pdf parsing will be disabled if library is missing
-import re
+    pdfplumber = None  # type: ignore
 
-# --- Normalization helpers ---
-# Italian stopwords and synonyms to improve matching on product descriptions.
+
+# -----------------------------------------------------------------------------
+# Environment setup
+#
+# Streamlit Cloud and other container environments may mount the root of the
+# filesystem as read‑only.  Streamlit writes a machine ID file and some
+# internal state to the user's home directory.  To avoid exceptions when
+# running under these constraints, set HOME and XDG_STATE_HOME to a
+# writeable directory under /tmp and ensure it exists.
+
+os.environ.setdefault("HOME", "/tmp")
+os.environ.setdefault("XDG_STATE_HOME", "/tmp")
+os.makedirs(os.path.join(os.environ["HOME"], ".streamlit"), exist_ok=True)
+
+
+# -----------------------------------------------------------------------------
+# Text normalization helpers
+#
+# To compare free‑form product descriptions, we tokenize each description,
+# remove common Italian stopwords and apply a small set of synonyms to
+# canonicalize terms.  Similarity is measured via a weighted combination of
+# Jaccard similarity on the token sets and a Levenshtein ratio on the raw
+# strings.
+
+# Common Italian stop words that should not affect matching
 STOPWORDS = {
     "in", "di", "da", "per", "a", "il", "la", "le", "i", "lo", "gli",
     "con", "su", "al", "del", "della", "dei", "degli", "un", "una", "uno",
     "ed", "e", "sul"
 }
 
+# Some domain‑specific synonyms to normalise variations in descriptions
 SYNONYMS: Dict[str, str] = {
     "bobina": "rotolo",
     "bobine": "rotolo",
@@ -58,21 +81,33 @@ SYNONYMS: Dict[str, str] = {
     "guanti": "guanto",
     "panni": "panno",
     "pellicole": "pellicola",
+    "pellicola": "pellicola",
     "nitrile": "nitrile",
-    # Other common variations can be added here
+    # Additional variations can be added here
 }
 
-def normalize_tokens(s: str) -> List[str]:
-    """Normalize a description by lowercasing, removing punctuation,
-    splitting on whitespace, dropping stopwords and applying synonyms."""
-    import re
-    tokens = re.sub(r"[^\w\s]", " ", s.lower()).split()
-    normalized = []
-    for token in tokens:
-        if token in STOPWORDS or not token:
+
+def normalize_tokens(description: str) -> List[str]:
+    """Split a description into normalised tokens.
+
+    The description is lower‑cased, punctuation is removed, and stopwords are
+    discarded.  Synonyms are substituted where defined.
+
+    Args:
+        description: The original product description.
+
+    Returns:
+        A list of normalised tokens.
+    """
+    # Replace non‑alphanumeric characters with spaces
+    cleaned = re.sub(r"[^\w\s]", " ", description.lower())
+    tokens = []
+    for tok in cleaned.split():
+        if tok in STOPWORDS:
             continue
-        normalized.append(SYNONYMS.get(token, token))
-    return normalized
+        tokens.append(SYNONYMS.get(tok, tok))
+    return tokens
+
 
 def jaccard_similarity(a: List[str], b: List[str]) -> float:
     """Compute Jaccard similarity between two token lists."""
@@ -85,351 +120,327 @@ def jaccard_similarity(a: List[str], b: List[str]) -> float:
     union = set_a | set_b
     return len(intersection) / len(union)
 
+
 def levenshtein_ratio(a: str, b: str) -> float:
-    """Compute normalized Levenshtein distance ratio (1 - distance/max_len)."""
-    # Simple implementation of Levenshtein distance
+    """Compute a normalised Levenshtein ratio between two strings.
+
+    This implementation computes the Levenshtein distance and converts it to
+    a ratio in the range [0, 1], where 1.0 indicates identical strings.
+    """
     m, n = len(a), len(b)
     if m == 0 and n == 0:
         return 1.0
-    # Initialize distance matrix
-    d = [[0] * (n + 1) for _ in range(m + 1)]
-    for i in range(m + 1):
-        d[i][0] = i
-    for j in range(n + 1):
-        d[0][j] = j
-    # Populate matrix
+    # Initialise distance matrix
+    d = [[i if j == 0 else j if i == 0 else 0 for j in range(n + 1)] for i in range(m + 1)]
     for i in range(1, m + 1):
         for j in range(1, n + 1):
             cost = 0 if a[i - 1] == b[j - 1] else 1
             d[i][j] = min(
-                d[i - 1][j] + 1,        # deletion
-                d[i][j - 1] + 1,        # insertion
-                d[i - 1][j - 1] + cost  # substitution
+                d[i - 1][j] + 1,       # deletion
+                d[i][j - 1] + 1,       # insertion
+                d[i - 1][j - 1] + cost # substitution
             )
     distance = d[m][n]
-    return 1.0 - distance / max(m, n)
+    return 1.0 - distance / float(max(m, n))
+
 
 def combined_similarity(desc1: str, desc2: str) -> float:
-    """Combine Jaccard similarity on normalized tokens with Levenshtein ratio."""
+    """Combine Jaccard and Levenshtein similarities for two descriptions."""
     tokens1 = normalize_tokens(desc1)
     tokens2 = normalize_tokens(desc2)
     jac = jaccard_similarity(tokens1, tokens2)
     lev = levenshtein_ratio(desc1.lower(), desc2.lower())
-    # Weight Jaccard more heavily because tokens capture key words
+    # Weight Jaccard slightly higher than Levenshtein
     return 0.6 * jac + 0.4 * lev
 
-# --- Parsing helpers ---
 
+# -----------------------------------------------------------------------------
+# Parsing helpers
+#
 def detect_headers_excel(df: pd.DataFrame) -> Dict[str, str]:
-    """Detect likely column names for code, description and quantity.
-    Returns a mapping from canonical names to actual column names in the dataframe.
-    This is a simple heuristic based on substrings."""
+    """Infer column names for code, description, quantity and frequency.
+
+    This function scans the DataFrame column labels for key substrings and
+    returns a mapping from canonical field names to actual DataFrame column
+    labels.  If no match is found the first or last column is returned as
+    appropriate.
+
+    Args:
+        df: A pandas DataFrame representing the sales history.
+
+    Returns:
+        A dict with keys 'code', 'description', 'quantity', 'frequency'.
+    """
     headers = [str(col).strip().lower() for col in df.columns]
     mapping: Dict[str, str] = {}
-    def pick(subs: List[str]) -> Optional[str]:
+
+    def pick(subs: List[str], default_index: int = 0) -> str:
         for sub in subs:
-            for col in df.columns:
-                if sub in str(col).lower():
-                    return col
-        return None
-    mapping['code'] = pick(['codice', 'code', 'art', 'item_code']) or df.columns[0]
-    mapping['description'] = pick(['descr', 'desc', 'articolo', 'item', 'description']) or df.columns[1] if len(df.columns) > 1 else df.columns[0]
-    mapping['quantity'] = pick(['quant', 'qty', 'qta']) or df.columns[-1]
+            for i, h in enumerate(headers):
+                if sub in h:
+                    return str(df.columns[i])
+        return str(df.columns[default_index])
+
+    mapping['code'] = pick(['codice', 'code', 'art'])
+    mapping['description'] = pick(['descr', 'descrizione', 'articolo', 'item'])
+    mapping['quantity'] = pick(['quant', 'qta', 'qty'], default_index=len(df.columns) - 1)
+    # Media 6 mesi may be in column named with 'media', 'mesi', or specific
+    mapping['frequency'] = pick(['media', '6 mesi', 'six'], default_index=len(df.columns) - 1)
     return mapping
 
-def parse_history_excel(file) -> Tuple[pd.DataFrame, List[Dict[str, any]]]:
-    """Parse an uploaded Excel file of purchase history.
-    Returns the dataframe and a list of rows with standardized keys.
 
-    The ``file`` parameter is a :class:`~streamlit.uploaded_file_manager.UploadedFile`
-    object produced by :func:`streamlit.file_uploader`.  To avoid issues
-    where the underlying file-like object becomes exhausted after the
-    Streamlit script reruns, we first read the file's raw bytes into
-    memory.  We then wrap those bytes in an :class:`io.BytesIO` buffer
-    before passing it to :func:`pandas.read_excel`.
+def parse_history_excel(file) -> Tuple[pd.DataFrame, List[Dict[str, Any]]]:
+    """Parse an uploaded sales history Excel file.
 
-    Parameters
-    ----------
-    file : UploadedFile
-        The Excel file uploaded by the user.
+    Args:
+        file: The UploadedFile provided by Streamlit.
 
-    Returns
-    -------
-    Tuple[pd.DataFrame, List[Dict[str, any]]]
-        A tuple containing the DataFrame representation of the file
-        and a list of dictionaries with keys ``item_code``, ``item_name``
-        and ``qty``.
+    Returns:
+        A tuple with the DataFrame and a list of dictionaries representing
+        products with their code, name, quantity ordered and frequency of
+        purchase.
     """
-    # Read file into an in-memory bytes buffer.  This prevents
-    # Streamlit's UploadedFile from being exhausted on subsequent
-    # script reruns or when accessed multiple times.
     file_bytes = file.getvalue()
     buffer = io.BytesIO(file_bytes)
     df = pd.read_excel(buffer)
     mapping = detect_headers_excel(df)
-    rows: List[Dict[str, any]] = []
+    rows: List[Dict[str, Any]] = []
     for _, r in df.iterrows():
         code = str(r.get(mapping['code'], '')).strip()
         desc = str(r.get(mapping['description'], '')).strip()
-        qty = r.get(mapping['quantity'], 0)
         try:
-            qty = float(qty)
+            qty = float(r.get(mapping['quantity'], 0) or 0)
         except Exception:
             qty = 0.0
-        rows.append({'item_code': code, 'item_name': desc, 'qty': qty})
+        # Frequency (six‑month average)
+        try:
+            freq = float(r.get(mapping['frequency'], 0) or 0)
+        except Exception:
+            freq = 0.0
+        rows.append({'item_code': code, 'item_name': desc, 'qty': qty, 'freq': freq})
     return df, rows
 
-def parse_order_file(uploaded_file) -> List[Dict[str, any]]:
-    """Parse an uploaded order file, which may be PDF or Excel.
-    Returns a list of order lines with vendor_code, item_description and quantity."""
+
+def parse_order_file(uploaded_file) -> List[Dict[str, Any]]:
+    """Parse an uploaded order file, either PDF or Excel.
+
+    Args:
+        uploaded_file: The order file uploaded by the user.
+
+    Returns:
+        A list of dictionaries each containing 'product_code',
+        'description' and 'quantity'.  If parsing fails, returns an empty list.
+    """
     name = uploaded_file.name.lower()
-    rows: List[Dict[str, any]] = []
-        if name.endswith('.pdf'):
+    rows: List[Dict[str, Any]] = []
+
+    # Helper to convert strings to floats safely
+    def safe_float(val, default: float = 0.0) -> float:
+        try:
+            if val is None:
+                return default
+            return float(str(val).replace(',', '.'))
+        except Exception:
+            return default
+
+    # PDF parsing
+    if name.endswith('.pdf'):
         if pdfplumber is None:
-            st.error("Il supporto per i file PDF non è disponibile: pdfplumber non è installato.")
+            st.error("PDF support is not available because pdfplumber is not installed.")
             return []
-        # Read PDF from bytes to avoid issues with the UploadedFile being reset
         pdf_bytes = uploaded_file.getvalue()
-            with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-                for page in pdf.pages:
-                    table = page.extract_table()
-                    if not table:
-                        # Fallback to text parsing when no table is found.
-                        # Extract the raw text from the page and attempt to parse
-                        # each product line. We look for a header marker ('Articolo Fornitore')
-                        # to know when the item rows start, skip HSN codes and total lines,
-                        # and split columns based on runs of two or more spaces. This
-                        # heuristic works for the Optima order PDFs which list the
-                        # product description followed by quantity, price and total.
-                        text = page.extract_text()
-                        if text:
-                            lines = [l.strip() for l in text.split('\n') if l.strip()]
-                            start_parsing = False
-                            for line_txt in lines:
-                                # Identify the start of the product list. In the Optima
-                                # PDFs the header line contains 'Articolo Fornitore'.
-                                if 'Articolo Fornitore' in line_txt:
-                                    start_parsing = True
-                                    continue
-                                if not start_parsing:
-                                    continue
-                                # Skip lines that are HSN codes or totals.
-                                if any(kw in line_txt for kw in ['HSN Code', 'Net Total', 'Grand Net Total']):
-                                    continue
-                                # Split by two or more spaces to separate columns.
-                                parts = re.split(r'\s{2,}', line_txt)
-                                if len(parts) >= 2:
-                                    desc = parts[0].strip()
-                                    qty_part = parts[1]
-                                    # Look for the first numeric substring (handles integers and decimals,
-                                    # with comma or dot as decimal separator). If not found, default to 1.
-                                    num_match = re.search(r'(\d+(?:[.,]\d+)?)', qty_part)
-                                    if num_match:
-                                        qty_str = num_match.group(1)
-                                        # Remove thousands separators and replace comma with dot for decimals.
-                                        qty_str = qty_str.replace('.', '').replace(',', '.')
-                                        try:
-                                            qty_val = float(qty_str)
-                                        except Exception:
-                                            qty_val = 0.0
-                                    else:
-                                        qty_val = 1.0
-                                    rows.append({
-                                        'vendor_code': '',
-                                        'item_description': desc,
-                                        'qty': qty_val
-                                    })
-                        # After parsing text for this page, move to next page.
-                        continue
-                    # Else: table extracted successfully. Proceed with table parsing.
-                    header = [c.lower().strip() for c in table[0]]
-                    # heuristically determine column indices
-                    def idx_of(subs: List[str], default: int) -> int:
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            for page in pdf.pages:
+                table = page.extract_table()
+                if table:
+                    # Heuristic: first row may be header; determine columns for code, desc, qty
+                    header = [str(c).lower().strip() for c in table[0]]
+                    def idx_of(subs: List[str], default: int = 0) -> int:
                         for sub in subs:
                             for i, h in enumerate(header):
                                 if sub in h:
                                     return i
                         return default
-                    idx_code = idx_of(['codice', 'code', 'art'], 0)
-                    idx_desc = idx_of(['descr', 'desc', 'articolo', 'item'], 1 if len(header) > 1 else 0)
-                    idx_qty = idx_of(['quant', 'qty'], len(header) - 1)
+                    idx_code = idx_of(['code', 'codice', 'art'])
+                    idx_desc = idx_of(['descr', 'articolo', 'item', 'description'], default=1 if len(header) > 1 else 0)
+                    idx_qty = idx_of(['quant', 'qty', 'qta'], default=len(header) - 1)
                     for r in table[1:]:
                         if not r:
                             continue
-                        code = r[idx_code] if idx_code < len(r) else ''
-                        desc = r[idx_desc] if idx_desc < len(r) else ''
-                        qty = r[idx_qty] if idx_qty < len(r) else '0'
-                        try:
-                            qty = float(qty)
-                        except Exception:
-                            qty = 0.0
-                        rows.append({'vendor_code': str(code).strip(),
-                                     'item_description': str(desc).strip(),
-                                     'qty': qty})
-    else:
-        # Assume Excel format for other file extensions.  Read the
-        # uploaded file's bytes into a buffer first to avoid exhausting
-        # the UploadedFile object on subsequent accesses.
-        excel_bytes = uploaded_file.getvalue()
-        buffer = io.BytesIO(excel_bytes)
-        df = pd.read_excel(buffer)
-        # pick columns heuristically
-        header = [str(c).lower() for c in df.columns]
-        def pick_idx(subs: List[str], default: int) -> int:
-            for sub in subs:
-                for i, h in enumerate(header):
-                    if sub in h:
-                        return i
-            return default
-        idx_code = pick_idx(['codice', 'code', 'art'], 0)
-        idx_desc = pick_idx(['descr', 'desc', 'articolo', 'item'], 1 if len(header) > 1 else 0)
-        idx_qty = pick_idx(['quant', 'qty'], len(header) - 1)
-        for _, r in df.iterrows():
-            code = r.iloc[idx_code] if idx_code < len(r) else ''
-            desc = r.iloc[idx_desc] if idx_desc < len(r) else ''
-            qty = r.iloc[idx_qty] if idx_qty < len(r) else 0
-            try:
-                qty = float(qty)
-            except Exception:
-                qty = 0.0
-            rows.append({'vendor_code': str(code).strip(),
-                         'item_description': str(desc).strip(),
-                         'qty': qty})
+                        code = str(r[idx_code]).strip() if idx_code < len(r) else ''
+                        desc = str(r[idx_desc]).strip() if idx_desc < len(r) else ''
+                        qty_val = r[idx_qty] if idx_qty < len(r) else ''
+                        qty = safe_float(qty_val, default=1.0)
+                        rows.append({'product_code': code, 'description': desc, 'quantity': qty})
+                else:
+                    # Fallback text parsing: split lines and attempt to extract quantity
+                    text = page.extract_text() or ''
+                    for raw in text.split('\n'):
+                        line = raw.strip()
+                        if not line:
+                            continue
+                        # Skip header or summary lines
+                        if any(kw in line.lower() for kw in ['articolo fornitore', 'net total', 'grand net total', 'hsn code']):
+                            continue
+                        # Split by two or more spaces to separate description and numbers
+                        parts = re.split(r"\s{2,}", line)
+                        desc = parts[0].strip()
+                        qty = 1.0
+                        if len(parts) > 1:
+                            # Look for the first numeric token in the remainder
+                            m = re.search(r"\d+(?:[\.,]\d+)?", " ".join(parts[1:]))
+                            if m:
+                                qty = safe_float(m.group(0), default=1.0)
+                        # Only accept lines that contain alphabetic characters
+                        if desc and any(ch.isalpha() for ch in desc):
+                            rows.append({'product_code': '', 'description': desc, 'quantity': qty})
+        return rows
+
+    # Excel parsing
+    # Assume order file is an Excel workbook with columns: code, description, quantity
+    excel_bytes = uploaded_file.getvalue()
+    buffer = io.BytesIO(excel_bytes)
+    df = pd.read_excel(buffer)
+    # Determine columns heuristically
+    cols = [str(c).lower() for c in df.columns]
+    def pick_idx(subs: List[str], default: int) -> int:
+        for sub in subs:
+            for i, h in enumerate(cols):
+                if sub in h:
+                    return i
+        return default
+    idx_code = pick_idx(['code', 'codice', 'art'], 0)
+    idx_desc = pick_idx(['descr', 'articolo', 'description', 'item'], 1 if len(cols) > 1 else 0)
+    idx_qty = pick_idx(['quant', 'qty', 'qta'], len(cols) - 1)
+    for _, r in df.iterrows():
+        code = str(r.iloc[idx_code]).strip() if idx_code < len(r) else ''
+        desc = str(r.iloc[idx_desc]).strip() if idx_desc < len(r) else ''
+        qty = safe_float(r.iloc[idx_qty], default=1.0) if idx_qty < len(r) else 1.0
+        rows.append({'product_code': code, 'description': desc, 'quantity': qty})
     return rows
 
-# --- Matching logic ---
 
-def match_orders(history_rows: List[Dict[str, any]], order_rows: List[Dict[str, any]], threshold: float = 0.35) -> List[Dict[str, any]]:
-    """Match each order row with the most similar history item.
-    Returns a list of result dicts including the match and similarity score."""
-    results: List[Dict[str, any]] = []
+def match_orders(
+    history_rows: List[Dict[str, Any]],
+    order_rows: List[Dict[str, Any]],
+    threshold: float = 0.35,
+    freq_weight: float = 0.3,
+) -> List[Dict[str, Any]]:
+    """Match customer order lines to products in the sales history.
+
+    Args:
+        history_rows: A list of dicts with 'item_code', 'item_name' and 'freq'.
+        order_rows: A list of dicts with 'product_code', 'description', 'quantity'.
+        threshold: Minimum similarity score to accept a description match.
+        freq_weight: Weight factor for purchase frequency in the similarity score.
+
+    Returns:
+        A list of dicts for each order line, containing the matched code,
+        matched description, score and type ('exact_code' or 'description_similarity').
+    """
+    # Precompute max frequency to normalise weights
+    max_freq = max((h['freq'] for h in history_rows), default=0.0)
+    results: List[Dict[str, Any]] = []
+
     for o in order_rows:
+        product_code = o.get('product_code', '').strip()
         best_match = None
         best_score = 0.0
-        match_type = "manual"
-        # Try exact code match first (if vendor_code is present)
-        v_code = (o.get('vendor_code') or '').strip()
-        if v_code:
+        match_type = 'manual'
+
+        # 1. Exact code match if code is present
+        if product_code:
             for h in history_rows:
-                if (h.get('item_code') or '').strip() == v_code:
+                if h['item_code'] == product_code:
                     best_match = h
                     best_score = 1.0
                     match_type = 'exact_code'
                     break
-        # Otherwise fall back to description similarity
+
+        # 2. Fuzzy description match if no exact code match
         if best_match is None:
+            desc = o.get('description', '')
             for h in history_rows:
-                score = combined_similarity(o.get('item_description', ''), h.get('item_name', ''))
+                score = combined_similarity(desc, h['item_name'])
+                # Weight by frequency (scaled to [0, 1])
+                if max_freq > 0:
+                    score *= (1.0 + (h['freq'] / max_freq) * freq_weight)
                 if score > best_score:
-                    best_match = h
                     best_score = score
-                    match_type = 'description'
-        # Accept match only if above threshold
-        if best_match and best_score >= threshold:
-            results.append({
-                'order_description': o.get('item_description', ''),
-                'order_qty': o.get('qty', 0),
-                'match_code': best_match.get('item_code', ''),
-                'match_description': best_match.get('item_name', ''),
-                'score': round(best_score, 3),
-                'type': match_type
-            })
-        else:
-            results.append({
-                'order_description': o.get('item_description', ''),
-                'order_qty': o.get('qty', 0),
-                'match_code': '',
-                'match_description': '',
-                'score': 0.0,
-                'type': 'manual'
-            })
+                    best_match = h
+                    match_type = 'description_similarity'
+            if best_score < threshold:
+                best_match = None
+                match_type = 'manual'
+
+        results.append({
+            'original_description': o.get('description', ''),
+            'quantity': o.get('quantity', 0),
+            'matched_code': best_match['item_code'] if best_match else '',
+            'matched_description': best_match['item_name'] if best_match else '',
+            'score': round(best_score, 3),
+            'match_type': match_type,
+        })
     return results
 
-# --- Streamlit UI ---
 
-st.set_page_config(page_title="Order Matching App")
+# -----------------------------------------------------------------------------
+# Streamlit UI
+#
 
-st.title("Order Matching App")
-st.write(
-    "Carica lo *storico degli acquisti* e uno o più *ordini clienti* (PDF o Excel)."
-    " Dopo il caricamento, l'app mostrerà il nome del file e, quando avrai sia lo storico"
-    " che un ordine, potrai eseguire il matching per trovare i codici corretti."
-)
+def main() -> None:
+    st.set_page_config(page_title="Order Matching", layout="wide")
+    st.title("Order Matching Application")
+    st.write("Upload a sales history file and a customer order to find matching product codes.")
 
-# Sidebar: similarity threshold
-st.sidebar.title("Parametri")
-threshold = st.sidebar.slider("Soglia di somiglianza", 0.0, 1.0, 0.35, 0.05)
+    # Sidebar parameters
+    st.sidebar.header("Matching Parameters")
+    threshold = st.sidebar.slider("Similarity Threshold", min_value=0.0, max_value=1.0, value=0.35, step=0.01)
+    freq_weight = st.sidebar.slider("Frequency Weight", min_value=0.0, max_value=1.0, value=0.3, step=0.05)
 
-# Initialize session state
-for key in ['history_rows', 'order_rows', 'history_file_name', 'order_file_name']:
-    if key not in st.session_state:
-        st.session_state[key] = None if 'name' in key else []
+    # File uploaders with unique keys so that selections persist across reruns
+    uploaded_history = st.file_uploader(
+        "Upload Sales History (Excel)", type=["xlsx", "xls"], key="history_file"
+    )
+    uploaded_order = st.file_uploader(
+        "Upload Customer Order (PDF or Excel)", type=["pdf", "xlsx", "xls"], key="order_file"
+    )
 
-# Upload historic purchases (Excel)
-uploaded_history = st.file_uploader(
-    "1. Carica storico acquisti (file Excel .xlsx/.xls)",
-    type=["xlsx", "xls"],
-    key="history_uploader",
-    help="Seleziona il file Excel contenente lo storico degli acquisti."
-)
-if uploaded_history is not None:
-    # Only parse if a new file is selected
-    if st.session_state.get('history_file_name') != uploaded_history.name:
-        try:
-            df_hist, hist_rows = parse_history_excel(uploaded_history)
-            st.session_state['history_rows'] = hist_rows
-            st.session_state['history_file_name'] = uploaded_history.name
-            st.success(f"Storico caricato: {uploaded_history.name}")
-        except Exception as e:
-            st.session_state['history_rows'] = []
-            st.error(f"Errore durante il caricamento dello storico: {e}")
-    else:
-        st.success(f"Storico già caricato: {uploaded_history.name}")
+    history_rows: List[Dict[str, Any]] = []
+    order_rows: List[Dict[str, Any]] = []
 
-# Upload customer order (PDF or Excel)
-uploaded_order = st.file_uploader(
-    "2. Carica ordine cliente (file PDF o Excel)",
-    type=["pdf", "xlsx", "xls"],
-    key="order_uploader",
-    help="Seleziona il file dell'ordine cliente in formato PDF o Excel."
-)
-if uploaded_order is not None:
-    if st.session_state.get('order_file_name') != uploaded_order.name:
-        try:
-            ord_rows = parse_order_file(uploaded_order)
-            st.session_state['order_rows'] = ord_rows
-            st.session_state['order_file_name'] = uploaded_order.name
-            st.success(f"Ordine caricato: {uploaded_order.name}")
-        except Exception as e:
-            st.session_state['order_rows'] = []
-            st.error(f"Errore durante il caricamento dell'ordine: {e}")
-    else:
-        st.success(f"Ordine già caricato: {uploaded_order.name}")
+    if uploaded_history:
+        with st.spinner("Parsing sales history..."):
+            _, history_rows = parse_history_excel(uploaded_history)
+        st.success(f"Loaded {len(history_rows)} product records from history.")
+    if uploaded_order:
+        with st.spinner("Parsing customer order..."):
+            order_rows = parse_order_file(uploaded_order)
+        st.success(f"Loaded {len(order_rows)} order lines.")
 
-st.write("""
-### 3. Matching ordini con storico
-Per eseguire il matching devi prima caricare sia lo storico che almeno un ordine.
-Premi il pulsante qui sotto per avviare l'elaborazione.
-""")
+    # Perform matching when both files are available
+    if history_rows and order_rows:
+        if st.button("Match Orders"):
+            with st.spinner("Matching order lines to history..."):
+                results = match_orders(history_rows, order_rows, threshold, freq_weight)
+            st.subheader("Matched Results")
+            st.write(
+                "Rows with 'manual' match type indicate that the description did not meet the similarity "
+                "threshold and require manual verification."
+            )
+            results_df = pd.DataFrame(results)
+            st.dataframe(results_df)
+            # Provide a download link for the results
+            towrite = io.BytesIO()
+            results_df.to_excel(towrite, index=False)
+            towrite.seek(0)
+            st.download_button(
+                label="Download Results as Excel",
+                data=towrite,
+                file_name="matched_orders.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
 
-if st.button("Avvia matching"):
-    if not st.session_state.get('history_rows'):
-        st.warning("Devi prima caricare lo storico degli acquisti.")
-    elif not st.session_state.get('order_rows'):
-        st.warning("Devi prima caricare un ordine cliente.")
-    else:
-        with st.spinner("Eseguo il matching…"):
-            results = match_orders(st.session_state['history_rows'], st.session_state['order_rows'], threshold)
-            if results:
-                res_df = pd.DataFrame(results)
-                st.write("## Risultati matching", res_df)
-                # Provide download link for Excel
-                buffer = io.BytesIO()
-                with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
-                    res_df.to_excel(writer, index=False)
-                st.download_button(
-                    "Scarica risultati", data=buffer.getvalue(),
-                    file_name="risultati_matching.xlsx", mime="application/vnd.ms-excel"
-                )
-            else:
-                st.info("Nessun abbinamento trovato sopra la soglia impostata.")
+
+if __name__ == "__main__":
+    main()
