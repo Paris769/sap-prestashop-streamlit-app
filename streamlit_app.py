@@ -38,10 +38,10 @@ import streamlit as st
 # to store its internal state. Without this, file uploads may silently fail.
 
 try:
-import pdfplumber  # type: ignore
-import re
+    import pdfplumber  # type: ignore
 except ImportError:
     pdfplumber = None  # pdf parsing will be disabled if library is missing
+import re
 
 # --- Normalization helpers ---
 # Italian stopwords and synonyms to improve matching on product descriptions.
@@ -220,15 +220,25 @@ def parse_order_file(uploaded_file) -> List[Dict[str, any]]:
                                 parts = re.split(r'\s{2,}', line_txt)
                                 if len(parts) >= 2:
                                     desc = parts[0].strip()
-                                    m = re.match(r'([0-9]+,[0-9]+)', parts[1])
-                                    if m:
+                                    qty_part = parts[1]
+                                    # Look for the first numeric substring (handles integers and decimals,
+                                    # with comma or dot as decimal separator). If not found, default to 1.
+                                    num_match = re.search(r'(\d+(?:[.,]\d+)?)', qty_part)
+                                    if num_match:
+                                        qty_str = num_match.group(1)
+                                        # Remove thousands separators and replace comma with dot for decimals.
+                                        qty_str = qty_str.replace('.', '').replace(',', '.')
                                         try:
-                                            qty_val = float(m.group(1).replace(',', '.'))
+                                            qty_val = float(qty_str)
                                         except Exception:
                                             qty_val = 0.0
-                                        rows.append({'vendor_code': '',
-                                                     'item_description': desc,
-                                                     'qty': qty_val})
+                                    else:
+                                        qty_val = 1.0
+                                    rows.append({
+                                        'vendor_code': '',
+                                        'item_description': desc,
+                                        'qty': qty_val
+                                    })
                         # After parsing text for this page, move to next page.
                         continue
                     # Else: table extracted successfully. Proceed with table parsing.
